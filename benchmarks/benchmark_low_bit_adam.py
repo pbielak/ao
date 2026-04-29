@@ -30,6 +30,7 @@
 #
 # See OPTIM_MAP for the available optimizer options
 # To profile and export chrome trace, set --profile
+# To capture full memory history snapshot, set --memory_profile
 # To enable cosine learning rate scheduler, set --cosine_lr_scheduler
 
 import argparse
@@ -75,6 +76,36 @@ try:
 
 except ImportError:
     pass
+
+
+def memory_record_start(device: str, max_entries: int = 100_000):
+    """Begin recording memory allocation history."""
+    getattr(torch, device).memory._record_memory_history(max_entries=max_entries)
+
+
+def memory_record_stop(device: str):
+    """Stop recording memory allocation history."""
+    getattr(torch, device).memory._record_memory_history(enabled=None)
+
+
+def memory_dump_snapshot(device: str, path: str):
+    """Dump a memory snapshot to a pickle file."""
+    getattr(torch, device).memory._dump_snapshot(path)
+
+
+def memory_snapshot_filename(args, device: str, peak_mem: float) -> str:
+    """Build a descriptive snapshot filename encoding run parameters."""
+    compile_tag = "compile" if args.compile else "eager"
+    parts = [
+        args.optim,
+        device,
+        f"amp-{args.amp}",
+        compile_tag,
+        f"bs{args.batch_size}",
+        f"{peak_mem:.2f}GB",
+        "mem",
+    ]
+    return "_".join(parts) + ".pkl"
 
 
 class CosineSchedule:
@@ -124,6 +155,7 @@ def get_parser():
     parser.add_argument("--project")
     parser.add_argument("--run_name", default="debug")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--memory_profile", action="store_true")
     parser.add_argument("--seed", type=int)
     return parser
 
@@ -211,6 +243,8 @@ if __name__ == "__main__":
         )
     if args.profile:
         args.n_epochs = 1
+    if args.memory_profile:
+        args.n_epochs = 1
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
@@ -225,6 +259,9 @@ if __name__ == "__main__":
         dir="/tmp",
         mode="disabled" if args.project is None else None,
     )
+
+    if args.memory_profile:
+        memory_record_start(_DEVICE)
 
     model = timm.create_model(
         args.model, pretrained=True, num_classes=45, **args.model_kwargs
@@ -351,10 +388,13 @@ if __name__ == "__main__":
                 if args.profile and step == 5:
                     break
 
+                if args.memory_profile and step == 5:
+                    break
+
         if args.profile:
             prof.export_chrome_trace("trace.json")
 
-        else:
+        elif not args.memory_profile:
             val_acc = evaluate_model(model, args)
             print(
                 f"Epoch {epoch_idx + 1}/{args.n_epochs}: val_acc={val_acc.item() * 100:.2f}"
@@ -364,3 +404,9 @@ if __name__ == "__main__":
     peak_mem = getattr(torch, _DEVICE).max_memory_allocated() / 1e9
     print(f"Max memory used: {peak_mem:.02f} GB")
     logger.log(dict(max_memory_allocated=peak_mem))
+
+    if args.memory_profile:
+        snapshot_name = memory_snapshot_filename(args, _DEVICE, peak_mem)
+        memory_dump_snapshot(_DEVICE, snapshot_name)
+        memory_record_stop(_DEVICE)
+        print(f"Memory snapshot written to {snapshot_name}")
